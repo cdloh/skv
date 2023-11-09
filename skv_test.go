@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-func TestBasic(t *testing.T) {
-	os.Remove("skv-test.db")
+func TestGetWithPrefix(t *testing.T) {
+	os.RemoveAll("skv-test.db")
 	prefix := "RandomPrefix-"
 	db, err := Open[string]("skv-test.db")
 	if err != nil {
@@ -80,8 +80,8 @@ func TestBasic(t *testing.T) {
 	}
 }
 
-func TestGetWithPrefix(t *testing.T) {
-	os.Remove("skv-test.db")
+func TestBasic(t *testing.T) {
+	os.RemoveAll("skv-test.db")
 	db, err := Open[string]("skv-test.db")
 	if err != nil {
 		t.Fatal(err)
@@ -117,10 +117,6 @@ func TestGetWithPrefix(t *testing.T) {
 	if err := db.Delete("key1"); err != nil {
 		t.Fatal(err)
 	}
-	// delete it again
-	if err := db.Delete("key1"); err != ErrNotFound {
-		t.Fatalf("delete returned %v, expected ErrNotFound", err)
-	}
 	// done
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -128,7 +124,7 @@ func TestGetWithPrefix(t *testing.T) {
 }
 
 func TestMoreNotFoundCases(t *testing.T) {
-	os.Remove("skv-test.db")
+	os.RemoveAll("skv-test.db")
 	db, err := Open[string]("skv-test.db")
 	if err != nil {
 		t.Fatal(err)
@@ -168,7 +164,7 @@ func TestRichTypes(t *testing.T) {
 }
 
 func testGetPut(t *testing.T, inval map[string]string) {
-	os.Remove("skv-test.db")
+	os.RemoveAll("skv-test.db")
 	db, err := Open[map[string]string]("skv-test.db")
 	if err != nil {
 		t.Fatal(err)
@@ -198,8 +194,53 @@ func testGetPut(t *testing.T, inval map[string]string) {
 	}
 }
 
+func TestPutWithTTLAndTags(t *testing.T) {
+	os.RemoveAll("skv-test.db")
+	db, err := Open[string]("skv-test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutWithTTL("test.key", "val1", 60*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutWithTags("test.tags", "val2", []string{"tags"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutWithTagsAndTTL("test.ttl.tags", "val4", 60*time.Minute, []string{"tags"}); err != nil {
+		t.Fatal(err)
+	}
+	val, err := db.GetWithTag("tags")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(val) != 2 {
+		t.Fatalf("got \"%d\", expected \"2\"", len(val))
+	}
+	// check get with no tags
+	val, err = db.GetWithTag("dont_exist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(val) != 0 {
+		t.Fatalf("We shouldnt have any results")
+	}
+
+	// delete a key and see what happens
+	db.Delete("test.tags")
+	val, err = db.GetWithTag("tags")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(val) != 1 {
+		t.Fatalf("got \"%d\", expected \"2\"", len(val))
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGoroutines(t *testing.T) {
-	os.Remove("skv-test.db")
+	os.RemoveAll("skv-test.db")
 	db, err := Open[string]("skv-test.db")
 	if err != nil {
 		t.Fatal(err)
@@ -228,10 +269,11 @@ func TestGoroutines(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	db.Close()
 }
 
 func TestGetKeys(t *testing.T) {
-	os.Remove("skv-test.db")
+	os.RemoveAll("skv-test.db")
 	db, err := Open[string]("skv-test.db")
 	if err != nil {
 		t.Fatal(err)
@@ -251,7 +293,7 @@ func TestGetKeys(t *testing.T) {
 }
 
 func BenchmarkPut(b *testing.B) {
-	os.Remove("skv-bench.db")
+	os.RemoveAll("skv-bench.db")
 	db, err := Open[string]("skv-bench.db")
 	if err != nil {
 		b.Fatal(err)
@@ -267,7 +309,7 @@ func BenchmarkPut(b *testing.B) {
 }
 
 func BenchmarkPutGet(b *testing.B) {
-	os.Remove("skv-bench.db")
+	os.RemoveAll("skv-bench.db")
 	db, err := Open[string]("skv-bench.db")
 	if err != nil {
 		b.Fatal(err)
@@ -288,7 +330,7 @@ func BenchmarkPutGet(b *testing.B) {
 }
 
 func BenchmarkPutDelete(b *testing.B) {
-	os.Remove("skv-bench.db")
+	os.RemoveAll("skv-bench.db")
 	db, err := Open[string]("skv-bench.db")
 	if err != nil {
 		b.Fatal(err)

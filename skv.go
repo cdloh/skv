@@ -18,15 +18,22 @@ import (
 	"bytes"
 	"encoding/gob"
 	"errors"
+	"fmt"
+	"sync"
 	"time"
 
-	"go.etcd.io/bbolt"
+	"git.mills.io/prologic/bitcask"
+)
+
+const (
+	CacheTagPattern = "db_tag_%s"
 )
 
 // KVStore represents the key value store. Use the Open() method to create
 // one, and Close() it when done.
 type KVStore[T any] struct {
-	db *bbolt.DB
+	db *bitcask.Bitcask
+	mu sync.RWMutex
 }
 
 var (
@@ -37,8 +44,6 @@ var (
 	// ErrBadValue is returned when the value supplied to the Put method
 	// is nil.
 	ErrBadValue = errors.New("skv: bad value")
-
-	bucketName = []byte("kv")
 )
 
 // Open a key-value store. "path" is the full path to the database file, any
@@ -49,22 +54,15 @@ var (
 // time. Attempts to open the file from another process will fail with a
 // timeout error.
 func Open[T any](path string) (*KVStore[T], error) {
-	opts := &bbolt.Options{
-		Timeout: 50 * time.Millisecond,
-	}
-	if db, err := bbolt.Open(path, 0640, opts); err != nil {
+	db, err := bitcask.Open(path)
+	if err != nil {
 		return nil, err
-	} else {
-		err := db.Update(func(tx *bbolt.Tx) error {
-			_, err := tx.CreateBucketIfNotExists(bucketName)
-			return err
-		})
-		if err != nil {
-			return nil, err
-		} else {
-			return &KVStore[T]{db: db}, nil
-		}
 	}
+	kv := KVStore[T]{
+		db: db,
+		mu: sync.RWMutex{},
+	}
+	return &kv, nil
 }
 
 // Put an entry into the store. The passed value is gob-encoded and stored.
@@ -83,9 +81,80 @@ func (kvs *KVStore[T]) Put(key string, value T) error {
 	if err := gob.NewEncoder(&buf).Encode(value); err != nil {
 		return err
 	}
-	return kvs.db.Update(func(tx *bbolt.Tx) error {
-		return tx.Bucket(bucketName).Put([]byte(key), buf.Bytes())
-	})
+	return kvs.db.Put([]byte(key), buf.Bytes())
+}
+
+// Put an entry into the store with a TTL to expire the entry
+func (kvs *KVStore[T]) PutWithTTL(key string, value T, ttl time.Duration) error {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(value); err != nil {
+		return err
+	}
+	return kvs.db.PutWithTTL([]byte(key), buf.Bytes(), ttl)
+}
+
+func (kvs *KVStore[T]) PutWithTags(key string, value T, tags []string) error {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(value); err != nil {
+		return err
+	}
+	err := kvs.db.Put([]byte(key), buf.Bytes())
+	if err != nil {
+		return err
+	}
+	return kvs.saveTags(key, tags)
+}
+
+// Put an entry into the store with a TTL to expire the entry
+func (kvs *KVStore[T]) PutWithTagsAndTTL(key string, value T, ttl time.Duration, tags []string) error {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(value); err != nil {
+		return err
+	}
+	err := kvs.db.PutWithTTL([]byte(key), buf.Bytes(), ttl)
+	if err != nil {
+		return err
+	}
+
+	return kvs.saveTags(key, tags)
+}
+
+func (kvs *KVStore[T]) saveTags(key string, tags []string) error {
+	// get the tags
+	kvs.mu.Lock()
+	defer kvs.mu.Unlock()
+
+	for _, tag := range tags {
+
+		var cacheKeys map[string]struct{}
+
+		tagKey := []byte(fmt.Sprintf(CacheTagPattern, tag))
+		if result, err := kvs.db.Get(tagKey); err == nil {
+			e := new(map[string]struct{})
+			d := gob.NewDecoder(bytes.NewReader(result))
+			d.Decode(e)
+			cacheKeys = *e
+		}
+
+		if cacheKeys == nil {
+			cacheKeys = make(map[string]struct{})
+		}
+
+		if _, exists := cacheKeys[key]; exists {
+			continue
+		}
+
+		cacheKeys[key] = struct{}{}
+
+		var buf bytes.Buffer
+		if err := gob.NewEncoder(&buf).Encode(cacheKeys); err != nil {
+			return err
+		}
+
+		kvs.db.Put(tagKey, buf.Bytes())
+
+	}
+	return nil
 }
 
 // Get an entry from the store. "value" must be a pointer-typed. If the key
@@ -112,35 +181,82 @@ func (kvs *KVStore[T]) Put(key string, value T) error {
 func (kvs *KVStore[T]) Get(key string) (T, error) {
 	output := new(T)
 
-	err := kvs.db.View(func(tx *bbolt.Tx) error {
-		c := tx.Bucket(bucketName).Cursor()
-		if k, v := c.Seek([]byte(key)); k == nil || string(k) != key {
-			return ErrNotFound
-		} else {
-			d := gob.NewDecoder(bytes.NewReader(v))
-			d.Decode(output)
-			return nil
-		}
-	})
-	return *output, err
+	v, e := kvs.db.Get([]byte(key))
+
+	if e == bitcask.ErrKeyNotFound {
+		return *output, ErrNotFound
+	}
+
+	if e != nil {
+		return *output, e
+	}
+
+	d := gob.NewDecoder(bytes.NewReader(v))
+	d.Decode(output)
+	return *output, e
 }
 
 func (kvs *KVStore[T]) GetWithPrefix(p string) ([]T, error) {
 	output := make([]T, 0)
-	kvs.db.View(func(tx *bbolt.Tx) error {
-		// Assume bucket exists and has keys
-		c := tx.Bucket([]byte(bucketName)).Cursor()
+	prefix := []byte(p)
 
-		prefix := []byte(p)
-		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			entry := new(T)
-			d := gob.NewDecoder(bytes.NewReader(v))
-			d.Decode(entry)
-			output = append(output, *entry)
+	err := kvs.db.Scan(prefix, func(key []byte) error {
+		entry, err := kvs.Get(string(key))
+		if err != nil {
+			return err
+		}
+		output = append(output, entry)
+		return err
+	})
+	return output, err
+}
+
+func (kvs *KVStore[T]) GetWithTag(tag string) ([]T, error) {
+	output := make([]T, 0)
+	tagKey := []byte(fmt.Sprintf(CacheTagPattern, tag))
+	updateTags := false
+
+	// lock the tags mutex
+	kvs.mu.Lock()
+	defer kvs.mu.Unlock()
+
+	var cacheKeys map[string]struct{}
+	if result, err := kvs.db.Get(tagKey); err == nil {
+		e := new(map[string]struct{})
+		d := gob.NewDecoder(bytes.NewReader(result))
+		d.Decode(e)
+		cacheKeys = *e
+	}
+
+	if cacheKeys == nil {
+		return output, nil
+	}
+
+	for key := range cacheKeys {
+		item, err := kvs.Get(key)
+
+		// key might have expired or deleted
+		if err == ErrNotFound {
+			delete(cacheKeys, key)
+			updateTags = true
+			continue
 		}
 
-		return nil
-	})
+		if err != nil {
+			return make([]T, 0), nil
+		}
+		output = append(output, item)
+	}
+
+	if updateTags {
+		var buf bytes.Buffer
+		if err := gob.NewEncoder(&buf).Encode(cacheKeys); err != nil {
+			return make([]T, 0), err
+		}
+
+		kvs.db.Put(tagKey, buf.Bytes())
+	}
+
 	return output, nil
 }
 
@@ -149,14 +265,7 @@ func (kvs *KVStore[T]) GetWithPrefix(p string) ([]T, error) {
 //
 //	store.Delete("key42")
 func (kvs *KVStore[T]) Delete(key string) error {
-	return kvs.db.Update(func(tx *bbolt.Tx) error {
-		c := tx.Bucket(bucketName).Cursor()
-		if k, _ := c.Seek([]byte(key)); k == nil || string(k) != key {
-			return ErrNotFound
-		} else {
-			return c.Delete()
-		}
-	})
+	return kvs.db.Delete([]byte(key))
 }
 
 // Iterate over all existing keys and return a slice of the keys.
@@ -166,16 +275,11 @@ func (kvs *KVStore[T]) Delete(key string) error {
 func (kvs *KVStore[T]) GetKeys() ([]string, error) {
 	var kl []string
 
-	err := kvs.db.View(func(tx *bbolt.Tx) error {
-		var err error
-		b := tx.Bucket(bucketName)
-
-		err = b.ForEach(func(k, v []byte) error {
-			kl = append(kl, string(k))
-			return err
-		})
-		return err
+	err := kvs.db.Sift(func(key []byte) (bool, error) {
+		kl = append(kl, string(key))
+		return false, nil
 	})
+
 	return kl, err
 }
 
@@ -186,20 +290,15 @@ func (kvs *KVStore[T]) GetKeys() ([]string, error) {
 func (kvs *KVStore[T]) GetAll() ([]T, error) {
 	var kl []T
 
-	err := kvs.db.View(func(tx *bbolt.Tx) error {
-		var err error
-		b := tx.Bucket(bucketName)
-
-		err = b.ForEach(func(k, v []byte) error {
-			entry := new(T)
-			d := gob.NewDecoder(bytes.NewReader(v))
-			d.Decode(entry)
-
-			kl = append(kl, *entry)
-			return err
-		})
-		return err
+	err := kvs.db.Sift(func(key []byte) (bool, error) {
+		entry, err := kvs.Get(string(key))
+		if err != nil {
+			return false, err
+		}
+		kl = append(kl, entry)
+		return false, nil
 	})
+
 	return kl, err
 }
 

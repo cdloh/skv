@@ -310,6 +310,11 @@ func (kvs *KVStore[T]) Maintenance() {
 	kvs.db.Sync()
 }
 
+// Reopens the key-value store file.
+func (kvs *KVStore[T]) Reopen() error {
+	return kvs.db.Reopen()
+}
+
 // Close closes the key-value store file.
 func (kvs *KVStore[T]) Close() error {
 	return kvs.db.Close()
